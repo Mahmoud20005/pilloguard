@@ -42,24 +42,14 @@ void onStart(ServiceInstance service) async {
   
   final bleService = BleService();
   
-  // Use mock data if hardware is not present for testing
-  bleService.startMockDataStream();
-
-  // Audio/Snore detection has been removed for now.
-
-  bleService.sensorDataStream.listen((data) {
-    DatabaseHelper.instance.insertSensorReading(
-      sessionId,
-      data['hr'],
-      data['spo2'],
-      data['ax'],
-      data['ay'],
-      data['az'],
-    );
+  await bleService.startScanning();
+  final telemetrySubscription = bleService.sensorDataStream.listen((data) {
+    DatabaseHelper.instance.insertSensorReading(sessionId, data);
   });
 
   service.on('stopService').listen((event) async {
-    bleService.stopScanningAndDisconnect();
+    await telemetrySubscription.cancel();
+    await bleService.stopScanningAndDisconnect();
     await DatabaseHelper.instance.endSession(sessionId, DateTime.now());
     service.stopSelf();
   });

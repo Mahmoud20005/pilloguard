@@ -6,6 +6,8 @@ import 'package:permission_handler/permission_handler.dart';
 import 'splash_screen.dart';
 import 'sleep_report_screen.dart';
 import 'ble_service.dart';
+import 'database.dart';
+import 'snore_confirmation_gate.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -33,12 +35,11 @@ class SnoreMonitorApp extends StatelessWidget {
         colorScheme: const ColorScheme.dark(
           primary: Color(0xFF6C63FF),
           secondary: Color(0xFF03DAC6),
-          background: Color(0xFF121212),
           surface: Color(0xFF1E1E1E),
         ),
         textTheme: GoogleFonts.outfitTextTheme(ThemeData.dark().textTheme),
       ),
-      home: const SplashScreen(),
+      home: const SplashScreen(destination: DashboardScreen()),
     );
   }
 }
@@ -54,6 +55,10 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
   StreamSubscription? _sensorDataSubscription;
+  Timer? _snoreIndicatorTimer;
+  int? _sessionId;
+  Future<int>? _sessionCreation;
+  late final SnoreConfirmationGate _snoreGate;
 
   int _heartRate = 0;
   int _spO2 = 0;
@@ -61,11 +66,15 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
   double _pillowX = 0.0;
   double _pillowY = 0.0;
   double _bodyTemp = 0.0;
-  bool _snoreDetectedNow = false;
+  final bool _snoreDetectedNow = false;
 
   @override
   void initState() {
     super.initState();
+    final bleService = Provider.of<BleService>(context, listen: false);
+    _snoreGate = SnoreConfirmationGate(
+      writeConfirmedCommand: () => bleService.writeCommand('SNORE_CONFIRMED'),
+    );
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1500),
@@ -75,25 +84,16 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
     );
     
     // Listen to BleService stream
-    final bleService = Provider.of<BleService>(context, listen: false);
     _sensorDataSubscription = bleService.sensorDataStream.listen((data) {
       if (!mounted) return;
       setState(() {
-        _heartRate = data['hr'] ?? 0;
-        _spO2 = data['spo2'] ?? 0;
-        _pillowX = data['ax'] ?? 0.0;
-        _pillowY = data['ay'] ?? 0.0;
-        _bodyTemp = data['temp'] ?? 0.0;
-        
-        bool isSnoring = data['snore'] ?? false;
-        if (isSnoring) {
-          _snoreCount++;
-          _snoreDetectedNow = true;
-          Future.delayed(const Duration(seconds: 1), () {
-            if (mounted) setState(() => _snoreDetectedNow = false);
-          });
-        }
+        _heartRate = (data['heart_rate'] as num?)?.toInt() ?? 0;
+        _spO2 = (data['spo2'] as num?)?.toInt() ?? 0;
+        _pillowX = (data['accel_x'] as num?)?.toDouble() ?? 0.0;
+        _pillowY = (data['accel_y'] as num?)?.toDouble() ?? 0.0;
+        _bodyTemp = (data['temperature'] as num?)?.toDouble() ?? 0.0;
       });
+      unawaited(_persistTelemetry(data));
     });
   }
 
@@ -101,12 +101,16 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
   void dispose() {
     _pulseController.dispose();
     _sensorDataSubscription?.cancel();
+    _snoreIndicatorTimer?.cancel();
+    _snoreGate.resetEpisode();
+    unawaited(_endCurrentSession());
     super.dispose();
   }
   
   Future<void> _requestPermissionsAndScan(BleService bleService) async {
     if (bleService.isConnected || bleService.isScanning) {
       bleService.stopScanningAndDisconnect();
+      await _endCurrentSession();
       _pulseController.stop();
       _pulseController.reset();
       setState(() {
@@ -126,9 +130,8 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
       Permission.location,
     ].request();
 
-    // In a real app we'd require these, but for demo fall back gracefully
-    if (statuses.values.every((status) => status.isGranted) || true) { 
-      bleService.startScanning();
+    if (statuses.values.every((status) => status.isGranted)) {
+      await bleService.startScanning();
       _pulseController.repeat(reverse: true);
     } else {
       if (mounted) {
@@ -136,7 +139,23 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
           const SnackBar(content: Text('Permissions required to scan for devices')),
         );
       }
+
     }
+  }
+
+  Future<void> _persistTelemetry(Map<String, dynamic> data) async {
+    _sessionCreation ??=
+        DatabaseHelper.instance.createSession(DateTime.now());
+    _sessionId ??= await _sessionCreation!;
+    await DatabaseHelper.instance.insertSensorReading(_sessionId!, data);
+  }
+
+  Future<void> _endCurrentSession() async {
+    final sessionId = _sessionId ?? await _sessionCreation;
+    if (sessionId == null) return;
+    await DatabaseHelper.instance.endSession(sessionId, DateTime.now());
+    _sessionId = null;
+    _sessionCreation = null;
   }
 
   @override
@@ -155,7 +174,7 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
     }
 
     return Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.background,
+      backgroundColor: Theme.of(context).colorScheme.surface,
       appBar: AppBar(
         title: const Text('SleepGuard', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2)),
         backgroundColor: Colors.transparent,
@@ -174,7 +193,7 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
                 duration: const Duration(milliseconds: 300),
                 padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
                 decoration: BoxDecoration(
-                  color: _snoreDetectedNow ? Colors.redAccent.withOpacity(0.2) : Colors.transparent,
+                  color: _snoreDetectedNow ? Colors.redAccent.withValues(alpha: 0.2) : Colors.transparent,
                   borderRadius: BorderRadius.circular(30),
                   border: Border.all(color: _snoreDetectedNow ? Colors.redAccent : Colors.transparent),
                 ),
@@ -192,8 +211,8 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
                       ),
                       const SizedBox(width: 8),
                       Text(
-                        bleService.isConnected 
-                          ? (bleService.isMockMode ? "Mock Hardware Connected" : "Device Connected") 
+                        bleService.isConnected
+                          ? "PilloGuard Connected"
                           : (bleService.isScanning ? "Scanning..." : "Disconnected"),
                         style: TextStyle(
                           color: bleService.isConnected ? Colors.blueAccent : Colors.grey, 
@@ -225,7 +244,7 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
                       ),
                       boxShadow: [
                         BoxShadow(
-                          color: ((bleService.isConnected || bleService.isScanning) ? Colors.deepPurple : Theme.of(context).colorScheme.primary).withOpacity(0.4),
+                          color: ((bleService.isConnected || bleService.isScanning) ? Colors.deepPurple : Theme.of(context).colorScheme.primary).withValues(alpha: 0.4),
                           blurRadius: 30,
                           spreadRadius: 10,
                         )
@@ -306,8 +325,8 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
         decoration: BoxDecoration(
           color: Theme.of(context).colorScheme.surface,
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: isMonitoring ? activeColor.withOpacity(0.3) : Colors.white10),
-          boxShadow: isMonitoring ? [BoxShadow(color: activeColor.withOpacity(0.1), blurRadius: 10)] : [],
+          border: Border.all(color: isMonitoring ? activeColor.withValues(alpha: 0.3) : Colors.white10),
+          boxShadow: isMonitoring ? [BoxShadow(color: activeColor.withValues(alpha: 0.1), blurRadius: 10)] : [],
         ),
         child: Column(
           children: [
@@ -329,14 +348,14 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
         decoration: BoxDecoration(
           color: Theme.of(context).colorScheme.surface,
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: isMonitoring ? Colors.greenAccent.withOpacity(0.3) : Colors.white10),
-          boxShadow: isMonitoring ? [BoxShadow(color: Colors.greenAccent.withOpacity(0.1), blurRadius: 10)] : [],
+          border: Border.all(color: isMonitoring ? Colors.greenAccent.withValues(alpha: 0.3) : Colors.white10),
+          boxShadow: isMonitoring ? [BoxShadow(color: Colors.greenAccent.withValues(alpha: 0.1), blurRadius: 10)] : [],
         ),
         child: Column(
           children: [
             Icon(Icons.bed, size: 28, color: isMonitoring ? Colors.greenAccent : Colors.grey),
             const SizedBox(height: 8),
-            const Text('Pillow Axis', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.grey)),
+            const Text('Pillow Axis', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.grey)),
             const SizedBox(height: 4),
             SizedBox(
               height: 25,
@@ -355,7 +374,7 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
                           color: Colors.white,
                           borderRadius: BorderRadius.circular(6),
                           boxShadow: [
-                            BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 4, offset: const Offset(0, 4))
+                            BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 4, offset: const Offset(0, 4))
                           ],
                         ),
                       ),
