@@ -1,5 +1,5 @@
-import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
+import 'package:sqflite/sqflite.dart';
 
 class DatabaseHelper {
   static final DatabaseHelper instance = DatabaseHelper._init();
@@ -7,78 +7,93 @@ class DatabaseHelper {
 
   DatabaseHelper._init();
 
-  Future<Database> get database async {
-    if (_database != null) return _database!;
-    _database = await _initDB('sleep_data.db');
-    return _database!;
-  }
+  Future<Database> get database async =>
+      _database ??= await _initDB('sleep_data.db');
 
   Future<Database> _initDB(String filePath) async {
-    final dbPath = await getDatabasesPath();
-    final path = join(dbPath, filePath);
-
-    return await openDatabase(path, version: 1, onCreate: _createDB);
+    final path = join(await getDatabasesPath(), filePath);
+    return openDatabase(
+      path,
+      version: 2,
+      onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+      onCreate: _createDB,
+      onUpgrade: _upgradeDB,
+    );
   }
 
-  Future _createDB(Database db, int version) async {
-    const idType = 'INTEGER PRIMARY KEY AUTOINCREMENT';
-    const textType = 'TEXT NOT NULL';
-    const integerType = 'INTEGER NOT NULL';
-    const realType = 'REAL NOT NULL';
-
+  Future<void> _createDB(Database db, int version) async {
     await db.execute('''
-CREATE TABLE SleepSessions (
-  id $idType,
-  startTime $textType,
-  endTime $textType
-)
-''');
-
+      CREATE TABLE SleepSessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        startTime TEXT NOT NULL,
+        endTime TEXT
+      )
+    ''');
     await db.execute('''
-CREATE TABLE SnoreEvents (
-  id $idType,
-  sessionId $integerType,
-  timestamp $textType,
-  confidence $realType,
-  FOREIGN KEY (sessionId) REFERENCES SleepSessions (id)
-)
-''');
-
+      CREATE TABLE SnoreEvents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sessionId INTEGER NOT NULL,
+        timestamp TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        FOREIGN KEY (sessionId) REFERENCES SleepSessions (id) ON DELETE CASCADE
+      )
+    ''');
     await db.execute('''
-CREATE TABLE SensorReadings (
-  id $idType,
-  sessionId $integerType,
-  timestamp $textType,
-  heartRate $integerType,
-  spO2 $integerType,
-  axisX $realType,
-  axisY $realType,
-  axisZ $realType,
-  FOREIGN KEY (sessionId) REFERENCES SleepSessions (id)
-)
-''');
+      CREATE TABLE SensorReadings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sessionId INTEGER NOT NULL,
+        timestamp TEXT NOT NULL,
+        heartRate INTEGER,
+        spO2 INTEGER,
+        temperature REAL,
+        axisX REAL,
+        axisY REAL,
+        axisZ REAL,
+        FOREIGN KEY (sessionId) REFERENCES SleepSessions (id) ON DELETE CASCADE
+      )
+    ''');
+  }
+
+  Future<void> _upgradeDB(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await db.execute('ALTER TABLE SleepSessions RENAME TO SleepSessions_old');
+      await db.execute('''
+        CREATE TABLE SleepSessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          startTime TEXT NOT NULL,
+          endTime TEXT
+        )
+      ''');
+      await db.execute('''
+        INSERT INTO SleepSessions (id, startTime, endTime)
+        SELECT id, startTime, NULLIF(endTime, startTime)
+        FROM SleepSessions_old
+      ''');
+      await db.execute('DROP TABLE SleepSessions_old');
+      await db.execute('ALTER TABLE SensorReadings ADD COLUMN temperature REAL');
+    }
   }
 
   Future<int> createSession(DateTime startTime) async {
-    final db = await instance.database;
-    return await db.insert('SleepSessions', {
-      'startTime': startTime.toIso8601String(),
-      'endTime': startTime.toIso8601String(), // Will be updated later
-    });
+    final db = await database;
+    return db.insert('SleepSessions', {'startTime': startTime.toIso8601String()});
   }
 
   Future<void> endSession(int sessionId, DateTime endTime) async {
-    final db = await instance.database;
+    final db = await database;
     await db.update(
       'SleepSessions',
       {'endTime': endTime.toIso8601String()},
-      where: 'id = ?',
+      where: 'id = ? AND endTime IS NULL',
       whereArgs: [sessionId],
     );
   }
 
   Future<void> insertSnoreEvent(int sessionId, double confidence) async {
-    final db = await instance.database;
+    if (confidence < 0 || confidence > 1) {
+      throw ArgumentError.value(confidence, 'confidence', 'Must be between 0 and 1.');
+    }
+    final db = await database;
     await db.insert('SnoreEvents', {
       'sessionId': sessionId,
       'timestamp': DateTime.now().toIso8601String(),
@@ -88,27 +103,30 @@ CREATE TABLE SensorReadings (
 
   Future<void> insertSensorReading(
     int sessionId,
-    int hr,
-    int spo2,
-    double ax,
-    double ay,
-    double az,
+    Map<String, dynamic> telemetry,
   ) async {
-    final db = await instance.database;
+    final db = await database;
     await db.insert('SensorReadings', {
       'sessionId': sessionId,
       'timestamp': DateTime.now().toIso8601String(),
-      'heartRate': hr,
-      'spO2': spo2,
-      'axisX': ax,
-      'axisY': ay,
-      'axisZ': az,
+      'heartRate': (telemetry['heart_rate'] as num?)?.toInt(),
+      'spO2': (telemetry['spo2'] as num?)?.toInt(),
+      'temperature': (telemetry['temperature'] as num?)?.toDouble(),
+      'axisX': (telemetry['accel_x'] as num?)?.toDouble(),
+      'axisY': (telemetry['accel_y'] as num?)?.toDouble(),
+      'axisZ': (telemetry['accel_z'] as num?)?.toDouble(),
     });
   }
 
+  Future<Map<String, dynamic>?> getLatestSession() async {
+    final db = await database;
+    final result = await db.query('SleepSessions', orderBy: 'id DESC', limit: 1);
+    return result.isEmpty ? null : result.first;
+  }
+
   Future<List<Map<String, dynamic>>> getSessionData(int sessionId) async {
-    final db = await instance.database;
-    return await db.query(
+    final db = await database;
+    return db.query(
       'SensorReadings',
       where: 'sessionId = ?',
       whereArgs: [sessionId],
@@ -116,16 +134,13 @@ CREATE TABLE SensorReadings (
     );
   }
 
-  Future<Map<String, dynamic>?> getLatestSession() async {
-    final db = await instance.database;
-    final result = await db.query(
-      'SleepSessions',
-      orderBy: 'id DESC',
-      limit: 1,
+  Future<List<Map<String, dynamic>>> getSnoreEvents(int sessionId) async {
+    final db = await database;
+    return db.query(
+      'SnoreEvents',
+      where: 'sessionId = ?',
+      whereArgs: [sessionId],
+      orderBy: 'timestamp ASC',
     );
-    if (result.isNotEmpty) {
-      return result.first;
-    }
-    return null;
   }
 }

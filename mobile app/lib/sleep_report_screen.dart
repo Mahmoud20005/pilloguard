@@ -1,4 +1,3 @@
-import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -16,7 +15,8 @@ class _SleepReportScreenState extends State<SleepReportScreen> {
   final List<BarChartGroupData> _snoreBarGroups = [];
   int _totalSnores = 0;
   bool _isLoading = true;
-  bool _isDemoData = false;
+  DateTime? _startTime;
+  DateTime? _endTime;
 
   int _avgHr = 0;
   int _avgSpo2 = 0;
@@ -30,110 +30,80 @@ class _SleepReportScreenState extends State<SleepReportScreen> {
 
   Future<void> _loadData() async {
     final latestSession = await DatabaseHelper.instance.getLatestSession();
-    
-    if (latestSession != null) {
-      final sessionId = latestSession['id'] as int;
-      final readings = await DatabaseHelper.instance.getSessionData(sessionId);
-      
-      if (readings.length > 10) {
-        // We have enough real data
-        _processRealData(readings);
-        return;
-      }
+    if (latestSession == null) {
+      if (mounted) setState(() => _isLoading = false);
+      return;
     }
-    
-    // Fallback to demo data for GitHub demo purposes
-    _generateMockData();
+
+    final sessionId = latestSession['id'] as int;
+    final readings = await DatabaseHelper.instance.getSessionData(sessionId);
+    final snoreEvents = await DatabaseHelper.instance.getSnoreEvents(sessionId);
+    _startTime = DateTime.tryParse(latestSession['startTime'] as String);
+    final endTime = latestSession['endTime'] as String?;
+    _endTime = endTime == null ? null : DateTime.tryParse(endTime);
+    _processRealData(readings, snoreEvents);
   }
 
-  void _processRealData(List<Map<String, dynamic>> readings) {
+  void _processRealData(
+    List<Map<String, dynamic>> readings,
+    List<Map<String, dynamic>> snoreEvents,
+  ) {
     _heartRateSpots.clear();
     _snoreBarGroups.clear();
     
     int totalHr = 0;
     int totalSpo2 = 0;
     
-    // Just a simplistic mapping for demo purposes
     for (int i = 0; i < readings.length; i++) {
       final reading = readings[i];
-      final hr = reading['heartRate'] as int;
-      final spo2 = reading['spO2'] as int;
-      
-      totalHr += hr;
-      totalSpo2 += spo2;
-      
-      // X axis is simply the reading index mapped to an 8 hour scale assuming we have ~readings.length over 8h
-      double x = (i / readings.length) * 8;
-      _heartRateSpots.add(FlSpot(x, hr.toDouble()));
+      final hr = (reading['heartRate'] as num?)?.toInt();
+      final spo2 = (reading['spO2'] as num?)?.toInt();
+      if (hr != null) {
+        totalHr += hr;
+        _heartRateSpots.add(FlSpot(i.toDouble(), hr.toDouble()));
+      }
+      if (spo2 != null) totalSpo2 += spo2;
     }
 
-    _avgHr = (totalHr / readings.length).round();
-    _avgSpo2 = (totalSpo2 / readings.length).round();
-    _avgTemp = 36.5; // Fixed temp since it wasn't saved in schema
-    _totalSnores = 0; // Requires snore table parsing which is out of scope for basic demo
-
-    setState(() {
-      _isLoading = false;
-      _isDemoData = false;
-    });
-  }
-
-  void _generateMockData() {
-    final random = Random();
-    
-    _heartRateSpots.clear();
-    _snoreBarGroups.clear();
-
-    // Generate realistic heart rate line data (8 hours)
-    for (double i = 0; i <= 8; i += 0.5) {
-      double baseHr = 70 - 12 * sin(i / 8 * pi); 
-      double noise = (random.nextDouble() * 4) - 2;
-      _heartRateSpots.add(FlSpot(i, baseHr + noise));
+    final hrCount = _heartRateSpots.length;
+    final spo2Count = readings.where((r) => r['spO2'] != null).length;
+    final temperatures = readings
+        .map((r) => (r['temperature'] as num?)?.toDouble())
+        .whereType<double>()
+        .toList();
+    _avgHr = hrCount == 0 ? 0 : (totalHr / hrCount).round();
+    _avgSpo2 = spo2Count == 0 ? 0 : (totalSpo2 / spo2Count).round();
+    _avgTemp = temperatures.isEmpty
+        ? 0
+        : temperatures.reduce((a, b) => a + b) / temperatures.length;
+    _totalSnores = snoreEvents.length;
+    for (final event in snoreEvents) {
+      final timestamp = DateTime.tryParse(event['timestamp'] as String);
+      if (timestamp == null) continue;
+      final hour = timestamp.difference(_startTime ?? timestamp).inHours;
+      final existing = _snoreBarGroups.indexWhere((group) => group.x == hour);
+      if (existing >= 0) {
+        final group = _snoreBarGroups[existing];
+        final count = (group.barRods.first.toY + 1).clamp(0, 50).toDouble();
+        _snoreBarGroups[existing] = BarChartGroupData(
+          x: hour,
+          barRods: [BarChartRodData(toY: count, color: Colors.orangeAccent)],
+        );
+      } else {
+        _snoreBarGroups.add(BarChartGroupData(
+          x: hour,
+          barRods: [BarChartRodData(toY: 1, color: Colors.orangeAccent)],
+        ));
+      }
     }
 
-    // Generate snore bar data (8 hours)
-    List<double> baseSnores = [5, 12, 28, 42, 35, 18, 8, 2];
-    double totalSnoresCalc = 0;
-    
-    for (int i = 0; i < 8; i++) {
-      double noise = (random.nextDouble() * 6) - 3; 
-      double snores = (baseSnores[i] + noise).clamp(0, 50).toDouble();
-      totalSnoresCalc += snores;
-      
-      _snoreBarGroups.add(
-        BarChartGroupData(
-          x: i,
-          barRods: [
-            BarChartRodData(
-              toY: snores,
-              gradient: const LinearGradient(
-                colors: [Colors.orangeAccent, Colors.deepOrange],
-                begin: Alignment.bottomCenter,
-                end: Alignment.topCenter,
-              ),
-              width: 16,
-              borderRadius: BorderRadius.circular(4),
-            )
-          ],
-        ),
-      );
-    }
-    
-    _totalSnores = totalSnoresCalc.toInt();
-    _avgHr = 64;
-    _avgSpo2 = 97;
-    _avgTemp = 36.4;
-
-    setState(() {
-      _isLoading = false;
-      _isDemoData = true;
-    });
+    if (mounted) setState(() => _isLoading = false);
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Theme.of(context).colorScheme.background,
+      backgroundColor: Theme.of(context).colorScheme.surface,
       appBar: AppBar(
         title: const Text('Sleep Report', style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.2)),
         backgroundColor: Colors.transparent,
@@ -147,27 +117,15 @@ class _SleepReportScreenState extends State<SleepReportScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (_isDemoData)
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 20),
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.blueAccent.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.blueAccent.withOpacity(0.3)),
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.info_outline, color: Colors.blueAccent),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Text(
-                            "Showing sample data. Start monitoring and save a session to view real data.",
-                            style: GoogleFonts.outfit(color: Colors.blueAccent, fontSize: 13),
-                          ),
-                        ),
-                      ],
-                    ),
+                if (_startTime == null)
+                  const Padding(
+                    padding: EdgeInsets.only(bottom: 20),
+                    child: Text('No data available for a sleep session.'),
+                  )
+                else
+                  Text(
+                    'Session: ${_startTime!.toLocal()} - ${_endTime?.toLocal() ?? 'In progress'}',
+                    style: const TextStyle(color: Colors.grey),
                   ),
                 _buildScoreHeader(),
                 const SizedBox(height: 30),
@@ -181,10 +139,10 @@ class _SleepReportScreenState extends State<SleepReportScreen> {
                   crossAxisSpacing: 16,
                   childAspectRatio: 1.5,
                   children: [
-                    _buildStatCard('Total Snores', '$_totalSnores', Icons.mic, Colors.orange),
-                    _buildStatCard('Avg Heart Rate', '$_avgHr bpm', Icons.favorite, Colors.redAccent),
-                    _buildStatCard('Avg SpO2', '$_avgSpo2 %', Icons.water_drop, Colors.lightBlue),
-                    _buildStatCard('Avg Temp', '$_avgTemp °C', Icons.thermostat, Colors.pinkAccent),
+                    _buildStatCard('Total Snores', _totalSnores == 0 ? 'No data available' : '$_totalSnores', Icons.mic, Colors.orange),
+                    _buildStatCard('Avg Heart Rate', _avgHr == 0 ? 'No data available' : '$_avgHr bpm', Icons.favorite, Colors.redAccent),
+                    _buildStatCard('Avg SpO2', _avgSpo2 == 0 ? 'No data available' : '$_avgSpo2 %', Icons.water_drop, Colors.lightBlue),
+                    _buildStatCard('Avg Temp', _avgTemp == 0 ? 'No data available' : '${_avgTemp.toStringAsFixed(1)} °C', Icons.thermostat, Colors.pinkAccent),
                   ],
                 ),
                 const SizedBox(height: 40),
@@ -220,7 +178,7 @@ class _SleepReportScreenState extends State<SleepReportScreen> {
         borderRadius: BorderRadius.circular(24),
         boxShadow: [
           BoxShadow(
-            color: Colors.deepPurple.withOpacity(0.3),
+            color: Colors.deepPurple.withValues(alpha: 0.3),
             blurRadius: 20,
             spreadRadius: 2,
           )
@@ -238,7 +196,7 @@ class _SleepReportScreenState extends State<SleepReportScreen> {
               ),
               const SizedBox(height: 8),
               Text(
-                '82 / 100',
+                _startTime == null ? 'Insufficient data' : 'Prototype summary',
                 style: GoogleFonts.outfit(color: Colors.white, fontSize: 32, fontWeight: FontWeight.bold),
               ),
             ],
@@ -308,7 +266,7 @@ class _SleepReportScreenState extends State<SleepReportScreen> {
               dotData: const FlDotData(show: false),
               belowBarData: BarAreaData(
                 show: true,
-                color: Colors.redAccent.withOpacity(0.15),
+                color: Colors.redAccent.withValues(alpha: 0.15),
               ),
             ),
           ],
